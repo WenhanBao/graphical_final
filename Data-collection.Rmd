@@ -1,0 +1,198 @@
+---
+output: html_document
+---
+
+```{r}
+library(TCGAbiolinks)
+library(sesameData)
+library(SummarizedExperiment)
+library(tidyverse)
+library(huge)
+library(rtracklayer)
+```
+
+# Gene notation
+
+```{r}
+gene_ann_v38 = readGFF("gencode.v38.annotation.gtf",
+                     version = 2L) %>% 
+  filter(type == "gene") %>% mutate()
+
+gene_ann_v38 = gene_ann_v38 %>% mutate(gene_id = str_sub(gene_id,1,15))
+```
+
+# Data collection from TCGA
+
+```{r}
+data_download <- function(project){
+  qge <- GDCquery(project=project,
+                  data.category = "Transcriptome Profiling",
+                  data.type = "Gene Expression Quantification", 
+                  workflow.type = "STAR - Counts")
+  
+  GDCdownload(query = qge)
+}
+  
+data_read <- function(project){
+  qge <- GDCquery(project=project,
+                  data.category = "Transcriptome Profiling",
+                  data.type = "Gene Expression Quantification", 
+                  workflow.type = "STAR - Counts")
+  
+  gedata <- GDCprepare(query = qge)
+  gemeta <- as.data.frame(colData(gedata))
+  TCGA_exp <- assay(gedata,'tpm_unstrand')
+  ind_tumor <- str_sub(gemeta$barcode, 14,15) != "11"
+  ind_normal <- str_sub(gemeta$barcode, 14,15) == "11"
+  TCGA_exp_tumor <- TCGA_exp[, ind_tumor]
+  TCGA_exp_normal <- TCGA_exp[, ind_normal]
+  
+  colnames(TCGA_exp_tumor) <- gemeta$patient[match(colnames(TCGA_exp_tumor),gemeta$barcode)]
+  TCGA_exp_tumor <- sapply(unique(colnames(TCGA_exp_tumor)),function(i){
+    rowMeans(TCGA_exp_tumor[,colnames(TCGA_exp_tumor)==i,drop=F],na.rm=T)
+    })
+  colnames(TCGA_exp_tumor) <- paste0("sample", 1:ncol(TCGA_exp_tumor))
+  rownames(TCGA_exp_tumor) <- str_sub(rownames(TCGA_exp_tumor), 1,15)
+  rownames(TCGA_exp_tumor) <- gene_ann_v38[match(rownames(TCGA_exp_tumor), gene_ann_v38$gene_id),]$gene_name
+  TCGA_exp_tumor <- log(TCGA_exp_tumor + 1, 2)
+  
+  colnames(TCGA_exp_normal) <- gemeta$patient[match(colnames(TCGA_exp_normal),gemeta$barcode)]
+  TCGA_exp_normal <- sapply(unique(colnames(TCGA_exp_normal)),function(i){
+    rowMeans(TCGA_exp_normal[,colnames(TCGA_exp_normal)==i,drop=F],na.rm=T)
+    })
+  colnames(TCGA_exp_normal) <- paste0("sample", 1:ncol(TCGA_exp_normal))
+  rownames(TCGA_exp_normal) <- str_sub(rownames(TCGA_exp_normal), 1,15)
+  rownames(TCGA_exp_normal) <- gene_ann_v38[match(rownames(TCGA_exp_normal), gene_ann_v38$gene_id),]$gene_name
+  TCGA_exp_normal <- log(TCGA_exp_normal + 1, 2)
+  
+  return(list(TCGA_exp_normal = TCGA_exp_normal, TCGA_exp_tumor = TCGA_exp_tumor))
+}
+```
+
+## Cancer
+
+```{r}
+## GBM -- Glioblastoma Multiforme 166 samples
+#data_download(project = "TCGA-GBM")
+GBM_df <- data_read(project = "TCGA-GBM")
+
+## LUSC -- Lung Squamous Cell Carcinoma 501 samples
+#data_download(project = "TCGA-LUSC")
+LUSC_df <- data_read(project = "TCGA-LUSC")
+
+## KIRC -- 	Kidney Renal Clear Cell Carcinoma 534 samples
+#data_download(project = "TCGA-KIRC")
+KIRC_df <- data_read(project = "TCGA-KIRC")
+
+## STAD-- Stomach Adenocarcinoma
+#data_download(project = "TCGA-STAD")
+STAD_df <- data_read(project = "TCGA-STAD")
+
+## LIHC-- Liver Hepatocellular Carcinoma
+#data_download(project = "TCGA-LIHC")
+LIHC_df <- data_read(project = "TCGA-LIHC")
+```
+
+## Gene selection
+
+```{r}
+pathway <- read_csv("/Users/nathan/Downloads/CTD_genes_pathways.csv",skip=27)
+
+y <- table(pathway$PathwayName) %>% data.frame()
+```
+
+## Glasso
+
+```{r}
+glasso_fun <- function(data, ind){
+  set.seed(2022)
+  glasso_res = huge(as.matrix(t(data)[,ind]), method = "glasso",
+                    nlambda = 100, lambda.min.ratio = 0.001)
+
+## Select the optimal lambda value by huge.select() for glasso
+  optim_lambda = huge.select(glasso_res, criterion = "ebic")
+
+## Refit the final glasso model
+  glasso_final = huge(as.matrix(t(data)[,ind]), method = "glasso",
+                      lambda = optim_lambda$opt.lambda)
+  colnames(glasso_final$path[[1]]) <- ind
+  rownames(glasso_final$path[[1]]) <- ind
+  return(glasso_final)
+}
+```
+
+### brca1
+
+```{r}
+brca1_ind <- filter(pathway, PathwayName == "BRCA1-associated genome surveillance complex (BASC)") %>% pull(1) %>% unique()
+
+gbm_tumor_p53 <- glasso_fun(data = GBM_df$TCGA_exp_tumor, ind = brca1_ind)
+gbm_normal_p53 <- glasso_fun(data = GBM_df$TCGA_exp_normal, ind = brca1_ind)
+
+LUSC_tumor_p53 <- glasso_fun(data = LUSC_df$TCGA_exp_tumor, ind = brca1_ind)
+LUSC_normal_p53 <- glasso_fun(data = LUSC_df$TCGA_exp_normal, ind = brca1_ind)
+
+KIRC_tumor_p53 <- glasso_fun(data = KIRC_df$TCGA_exp_tumor, ind = brca1_ind)
+KIRC_normal_p53 <- glasso_fun(data = KIRC_df$TCGA_exp_normal, ind = brca1_ind)
+
+STAD_tumor_p53 <- glasso_fun(data = STAD_df$TCGA_exp_tumor, ind = brca1_ind)
+STAD_normal_p53 <- glasso_fun(data = STAD_df$TCGA_exp_normal, ind = brca1_ind)
+
+LIHC_tumor_p53 <- glasso_fun(data = LIHC_df$TCGA_exp_tumor, ind = brca1_ind)
+LIHC_normal_p53 <- glasso_fun(data = LIHC_df$TCGA_exp_normal, ind = brca1_ind)
+
+brca1_normal = LUSC_normal_p53$path[[1]] + KIRC_normal_p53$path[[1]] + STAD_normal_p53$path[[1]] + LIHC_normal_p53$path[[1]] == 0
+brca1_tumor = gbm_tumor_p53$path[[1]] + LUSC_tumor_p53$path[[1]] + KIRC_tumor_p53$path[[1]] + STAD_tumor_p53$path[[1]] + LIHC_tumor_p53$path[[1]] != 0
+brca1_normal == brca1_tumor
+```
+
+## Notch
+
+```{r}
+ras_ind <- filter(pathway, PathwayName == "Notch signaling") %>% pull(1) %>% unique()
+
+gbm_tumor_ras <- glasso_fun(data = GBM_df$TCGA_exp_tumor, ind = ras_ind)
+gbm_normal_ras <- glasso_fun(data = GBM_df$TCGA_exp_normal, ind = ras_ind)
+
+LUSC_tumor_ras <- glasso_fun(data = LUSC_df$TCGA_exp_tumor, ind = ras_ind)
+LUSC_normal_ras <- glasso_fun(data = LUSC_df$TCGA_exp_normal, ind = ras_ind)
+
+KIRC_tumor_ras <- glasso_fun(data = KIRC_df$TCGA_exp_tumor, ind = ras_ind)
+KIRC_normal_ras <- glasso_fun(data = KIRC_df$TCGA_exp_normal, ind = ras_ind)
+
+STAD_tumor_ras <- glasso_fun(data = STAD_df$TCGA_exp_tumor, ind = ras_ind)
+STAD_normal_ras <- glasso_fun(data = STAD_df$TCGA_exp_normal, ind = ras_ind)
+
+LIHC_tumor_ras <- glasso_fun(data = LIHC_df$TCGA_exp_tumor, ind = ras_ind)
+LIHC_normal_ras <- glasso_fun(data = LIHC_df$TCGA_exp_normal, ind = ras_ind)
+
+erbb_normal = LUSC_normal_ras$path[[1]] + KIRC_normal_ras$path[[1]] + STAD_normal_ras$path[[1]] + LIHC_normal_ras$path[[1]] == 0
+erbb_tumor = gbm_tumor_ras$path[[1]] + LUSC_tumor_ras$path[[1]] + KIRC_tumor_ras$path[[1]] + STAD_tumor_ras$path[[1]] + LIHC_tumor_ras$path[[1]] != 0
+erbb_res = erbb_normal == erbb_tumor
+```
+
+## PI3K-Akt signaling
+
+```{r}
+ras_ind <- filter(pathway, PathwayName == "PI3K-Akt signaling") %>% pull(1) %>% unique()
+
+gbm_tumor_ras <- glasso_fun(data = GBM_df$TCGA_exp_tumor, ind = ras_ind)
+gbm_normal_ras <- glasso_fun(data = GBM_df$TCGA_exp_normal, ind = ras_ind)
+
+LUSC_tumor_ras <- glasso_fun(data = LUSC_df$TCGA_exp_tumor, ind = ras_ind)
+LUSC_normal_ras <- glasso_fun(data = LUSC_df$TCGA_exp_normal, ind = ras_ind)
+
+KIRC_tumor_ras <- glasso_fun(data = KIRC_df$TCGA_exp_tumor, ind = ras_ind)
+KIRC_normal_ras <- glasso_fun(data = KIRC_df$TCGA_exp_normal, ind = ras_ind)
+
+STAD_tumor_ras <- glasso_fun(data = STAD_df$TCGA_exp_tumor, ind = ras_ind)
+STAD_normal_ras <- glasso_fun(data = STAD_df$TCGA_exp_normal, ind = ras_ind)
+
+LIHC_tumor_ras <- glasso_fun(data = LIHC_df$TCGA_exp_tumor, ind = ras_ind)
+LIHC_normal_ras <- glasso_fun(data = LIHC_df$TCGA_exp_normal, ind = ras_ind)
+
+erbb_normal = LUSC_normal_ras$path[[1]] + KIRC_normal_ras$path[[1]] + STAD_normal_ras$path[[1]] + LIHC_normal_ras$path[[1]] == 0
+erbb_tumor = gbm_tumor_ras$path[[1]] + LUSC_tumor_ras$path[[1]] + KIRC_tumor_ras$path[[1]] + STAD_tumor_ras$path[[1]] + LIHC_tumor_ras$path[[1]] != 0
+erbb_res = erbb_normal == erbb_tumor
+```
+
